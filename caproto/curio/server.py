@@ -1,4 +1,3 @@
-import sys
 import logging
 import random
 
@@ -139,7 +138,9 @@ class VirtualCircuit:
                             ioid=command.ioid, metadata=metadata)
         elif isinstance(command, (ca.WriteRequest, ca.WriteNotifyRequest)):
             chan, db_entry = get_db_entry()
-            write_status = db_entry.set_dbr_data(command)
+            write_status = db_entry.set_dbr_data(data=command.data,
+                                                 data_type=command.data_type,
+                                                 metadata=command.metadata)
             yield chan.write(ioid=command.ioid, status=write_status)
         elif isinstance(command, ca.EventAddRequest):
             chan, db_entry = get_db_entry()
