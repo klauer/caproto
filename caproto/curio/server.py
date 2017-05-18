@@ -259,7 +259,7 @@ async def _test(pvdb=None):
                 'enum': ChannelEnum(value='b',
                                     strs=['a', 'b', 'c', 'd'],
                                     ),
-                'int': ChannelInteger(value=0,
+                'int': ChannelInteger(value=96,
                                       units='doodles',
                                       ),
                 'char': ca.ChannelChar(value=b'3',
