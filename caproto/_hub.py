@@ -129,12 +129,9 @@ class VirtualCircuit:
             any number of bytes-like buffers
         """
         total_received = sum(len(byteslike) for byteslike in buffers)
-        if total_received == 0:
-            self.log.debug('Zero-length recv; sending disconnect notification')
-            self.command_queue.put(DISCONNECTED)
-            return
-
         self.log.debug("Received %d bytes.", total_received)
+
+        # TODO for performance reasons, this should probably be a b''.join()
         for byteslike in buffers:
             self._data += byteslike
 
@@ -150,6 +147,11 @@ class VirtualCircuit:
                 self.log.debug("%d bytes are cached. Need more bytes to parse "
                                "next command.", len_data)
                 break
+
+        if buffers and len(buffers[-1]) == 0:
+            self.log.debug('Zero-length recv; sending disconnect notification')
+            self.command_queue.put(DISCONNECTED)
+            return
 
     def process_command(self, role, command):
         """
@@ -301,8 +303,10 @@ class VirtualCircuit:
         Clients should call this method when a TCP connection is lost.
         """
         # poison the queue
-        self.command_queue.put(DISCONNECTED)
-        self.states.disconnect()
+        if (self.states[CLIENT] != DISCONNECTED or
+                self.states[SERVER] != DISCONNECTED):
+            self.command_queue.put(DISCONNECTED)
+            self.states.disconnect()
 
     def new_channel_id(self):
         "Return a valid value for a cid or sid."
@@ -678,17 +682,6 @@ class ServerChannel(_BaseChannel):
         CreateChFailResponse
         """
         command = CreateChFailResponse(self.cid)
-        return command
-
-    def disconnect(self):
-        """
-        Generate a valid :class:`ClearChannelResponse`.
-
-        Returns
-        -------
-        ClearChannelResponse
-        """
-        command = ClearChannelResponse(self.sid, self.cid)
         return command
 
     def read(self, data, ioid, data_type=None, data_count=None, status=1, *,
