@@ -29,6 +29,7 @@ class VirtualCircuit:
         self.ioids = {}  # map ioid to Channel
         self.ioid_data = {}  # map ioid to server response
         self.subscriptionids = {}  # map subscriptionid to Channel
+        self.connected = True
         self.socket = None
         self.new_command_condition = curio.Condition()
         self._socket_lock = curio.Lock()
@@ -39,15 +40,21 @@ class VirtualCircuit:
 
         while True:
             bytes_received = await self.socket.recv(32768)
-            if not len(bytes_received):
-                self.circuit.disconnect()
-                break
             self.circuit.recv(bytes_received)
+            if not len(bytes_received):
+                self.connected = False
+                break
 
     async def _command_queue_loop(self):
         queue = self.circuit.command_queue
         while True:
             command = await queue.get()
+            if isinstance(command, ca.DISCONNECTED):
+                self.circuit.disconnect()
+                async with self.new_command_condition:
+                    await self.new_command_condition.notify_all()
+                break
+
             try:
                 self.circuit.process_command(self.circuit.their_role, command)
             except Exception as ex:
@@ -81,11 +88,12 @@ class VirtualCircuit:
         """
         Process a command and tranport it over the TCP socket for this circuit.
         """
-        buffers_to_send = self.circuit.send(*commands)
-        async with self._socket_lock:
-            if self.socket is None:
-                raise RuntimeError('socket connection failed')
-            await self.socket.sendmsg(buffers_to_send)
+        if self.connected:
+            buffers_to_send = self.circuit.send(*commands)
+            async with self._socket_lock:
+                if self.socket is None:
+                    raise RuntimeError('socket connection failed')
+                await self.socket.sendmsg(buffers_to_send)
 
 
 class Channel:
@@ -179,6 +187,7 @@ class Channel:
 
         task = await curio.spawn(_queue_loop, daemon=True)
         self.monitoring_tasks[command.subscriptionid] = task
+        return command.subscriptionid
 
     async def unsubscribe(self, subscriptionid, *args, **kwargs):
         "Cancel a subscription and await confirmation from the server."
@@ -372,9 +381,9 @@ async def main():
     await chan2.wait_for_connection()
     reading = await chan1.read()
     print('reading:', reading)
-    await chan1.subscribe()
+    sub_id = await chan1.subscribe()
     await chan2.read()
-    await chan1.unsubscribe(0)
+    await chan1.unsubscribe(sub_id)
     await chan1.write((5,))
     reading = await chan1.read()
     print('reading:', reading)

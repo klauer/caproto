@@ -1,8 +1,6 @@
 import os
 import datetime
-import logging
 import time
-from multiprocessing import Process
 
 import pytest
 import curio
@@ -17,25 +15,6 @@ from caproto import ChType
 
 REPEATER_PORT = 5065
 SERVER_HOST = '0.0.0.0'
-
-
-def get_broadcast_addr_list():
-    import netifaces
-
-    interfaces = [netifaces.ifaddresses(interface)
-                  for interface in netifaces.interfaces()
-                  ]
-    bcast = [af_inet_info['broadcast']
-             if 'broadcast' in af_inet_info
-             else af_inet_info['peer']
-
-             for interface in interfaces
-             if netifaces.AF_INET in interface
-             for af_inet_info in interface[netifaces.AF_INET]
-             ]
-
-    print('Broadcast address list:', bcast)
-    return ' '.join(bcast)
 
 
 def setup_module(module):
@@ -123,10 +102,10 @@ def test_curio_server():
     import caproto.curio.client as client
     from caproto.curio.server import _test as example_server
     kernel = curio.Kernel()
+    called = []
 
     async def run_client():
         # Some user function to call when subscriptions receive data.
-        called = []
 
         def user_callback(command):
             print("Subscription has received data.")
@@ -143,8 +122,8 @@ def test_curio_server():
         await chan1.wait_for_connection()
         reading = await chan1.read()
         print('reading:', reading)
-        await chan1.subscribe()
-        await chan1.unsubscribe(0)
+        sub_id = await chan1.subscribe()
+        await chan1.unsubscribe(sub_id)
         await chan1.write((5,))
         reading = await chan1.read()
         print('reading:', reading)
@@ -152,7 +131,6 @@ def test_curio_server():
         reading = await chan1.read()
         print('reading:', reading)
         await chan1.disconnect()
-        assert called
         await chan1.circuit.socket.close()
 
     async def task():
@@ -169,6 +147,7 @@ def test_curio_server():
 
     with kernel:
         kernel.run(task)
+    assert called, 'subscription not called in client'
     print('done')
 
 
@@ -338,7 +317,7 @@ caget_pvdb = {
                            units='doodles',
                            ),
     'enum': ca.ChannelEnum(value='b',
-                           strs=['a', 'b', 'c', 'd'],
+                           enum_strings=['a', 'b', 'c', 'd'],
                            ),
     'int': ca.ChannelInteger(value=33,
                              units='poodles',
@@ -418,8 +397,6 @@ def test_curio_server_with_caget(curio_server, pv, dbr_type):
                  'upper_warning_limit', 'lower_ctrl_limit',
                  'upper_ctrl_limit', 'precision')
 
-    status_keys = ('status', 'severity')
-
     async def run_client_test():
         print('* client_test', pv, dbr_type)
         db_entry = caget_pvdb[pv]
@@ -439,7 +416,7 @@ def test_curio_server_with_caget(curio_server, pv, dbr_type):
                 not (req_native == ChType.STRING
                      or dbr_type in (ChType.CTRL_ENUM,
                                      ChType.GR_ENUM))):
-            db_value = db_entry.strs.index(db_value)
+            db_value = db_entry.enum_strings.index(db_value)
         if req_native in (ChType.INT, ChType.LONG, ChType.SHORT, ChType.CHAR):
             if db_native == ChType.CHAR:
                 assert int(data['value']) == ord(db_value)
@@ -531,15 +508,3 @@ def test_curio_server_with_caget(curio_server, pv, dbr_type):
     with curio.Kernel() as kernel:
         kernel.run(task)
     print('done')
-
-
-if __name__ == '__main__':
-    setup_module(None)
-    os.environ['EPICS_CA_ADDR_LIST'] = get_broadcast_addr_list()
-    os.environ['EPICS_CA_AUTO_ADDR_LIST'] = 'no'
-    try:
-        test_curio_client()
-        test_curio_server()
-        test_curio_server_with_caget()
-    finally:
-        teardown_module(None)
