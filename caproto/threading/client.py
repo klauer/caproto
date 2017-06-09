@@ -19,8 +19,6 @@ class ConditionType:
     ...
 
 
-CA_REPEATER_PORT = 5065
-CA_SERVER_PORT = 5064
 AUTOMONITOR_MAXLENGTH = 65536
 STALE_SEARCH_THRESHOLD = 10.0
 
@@ -393,8 +391,8 @@ class VirtualCircuit:
                     break
 
                 try:
-                    self.circuit.process_command(
-                        self.circuit.their_role, command)
+                    self.circuit.process_command(self.circuit.their_role,
+                                                 command)
                 except Exception as ex:
                     logger.error('Command queue evaluation failed: {!r}'
                                  ''.format(command), exc_info=ex)
