@@ -254,6 +254,11 @@ class ChannelData:
             future.set_exception(ex)
         else:
             future.set_result(True)
+            sub_queue = self._subscription_queue
+            if sub_queue is not None:
+                sub_queue.put((self, SubscriptionType.DBE_VALUE,
+                               self.value) +
+                              self._subscription_queue_args)
         return True
 
     @awaitable(set_dbr_data)
