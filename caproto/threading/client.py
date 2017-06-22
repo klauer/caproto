@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 import weakref
+import selectors
 
 from collections import Iterable
 
@@ -44,45 +45,89 @@ def _condition_with_timeout(bail_condition: Callable[[], bool],
                 raise TimeoutError()
 
 
-class SocketThread:
-    def __init__(self, socket, target_obj):
-        self.socket = socket
-        if socket.timeout is None:
-            socket.settimeout(.1)
-        self.target_obj = weakref.ref(target_obj)
+class SelectorThread:
+    def __init__(self):
+        self._running = False
+        self.selector = selectors.DefaultSelector()
+        self.object_to_socket = {}
+        self.socket_to_object = {}
         self.thread = threading.Thread(target=self, daemon=True)
+
+    @property
+    def running(self):
+        '''Selector thread is running'''
+        return self._running
+
+    def stop(self):
+        self._running = False
+
+    def start(self):
+        self._running = True
         self.thread.start()
-        self.poison_ev = threading.Event()
+
+    def add_socket(self, socket, target_obj):
+        socket.setblocking(False)
+        ref = target_obj  # weakref.proxy(target_obj, self._object_removed)
+        close_event = threading.Event()
+
+        self.object_to_socket[ref] = (socket, close_event)
+        self.socket_to_object[socket] = (ref, close_event)
+        self.selector.register(socket, selectors.EVENT_READ)
+
+    def remove_socket(self, socket):
+        obj, close_event = self.socket_to_object.pop(socket)
+        del self.object_to_socket[obj]
+        self.selector.unregister(socket)
+        if not close_event.isSet():
+            close_event.set()
+        if not self.socket_to_object:
+            self.stop()
+
+    def _object_removed(self, ref):
+        socket, close_event = self.object_to_socket.pop(ref)
+        del self.socket_to_object[socket]
+        self.selector.unregister(socket)
+        if not close_event.isSet():
+            close_event.set()
 
     def __call__(self):
-        while True:
-            try:
-                bytes_recv, address = self.socket.recvfrom(4096)
-            except socket.timeout:
-                if self.poison_ev.isSet():
+        '''Selector poll loop'''
+        while self._running:
+            events = self.selector.select(timeout=0.5)
+            for key, mask in events:
+                sock = key.fileobj
+                obj, close_ev = self.socket_to_object[sock]
+                # TODO: consider thread pool for recv and command_loop
+                try:
+                    bytes_recv, address = sock.recvfrom(4096)
+                except OSError:
                     bytes_recv, address = b'', None
+
+                try:
+                    recv_method = obj.received
+                except ReferenceError:
+                    self._object_removed(obj)
+                    return
                 else:
-                    continue
-            except OSError:
-                bytes_recv, address = b'', None
+                    recv_method(bytes_recv, address)
 
-            target = self.target_obj()
-            if target is None:
-                break
 
-            target.received(bytes_recv, address)
-            if not len(bytes_recv):
-                target.disconnect()
-                # this is important to not keep a hard-ref to the target
-                target = None
-                return
+_selector = None
+
+def get_selector():
+    '''Shared Selector thread between all clients'''
+    global _selector
+    if _selector is None:
+        _selector = SelectorThread()
+    if not _selector.running:
+        _selector.start()
+    return _selector
 
 
 class SharedBroadcaster:
     def __init__(self, *, log_level='ERROR'):
         self.log_level = log_level
         self.udp_sock = None
-        self.sock_thread = None
         self._search_lock = threading.RLock()
 
         self.search_results = {}  # map name to (time, address)
@@ -102,7 +147,8 @@ class SharedBroadcaster:
     def __create_sock(self):
         # UDP socket broadcasting to CA servers
         self.udp_sock = ca.bcast_socket()
-        self.sock_thread = SocketThread(self.udp_sock, self)
+        selector = get_selector()
+        selector.add_socket(self.udp_sock, self)
 
     def add_listener(self, listener):
         self.listeners.add(listener)
@@ -121,27 +167,20 @@ class SharedBroadcaster:
             self.disconnect()
 
     def disconnect(self, *, wait=True):
-        th = []
-
         if self.udp_sock is not None:
-            self.sock_thread.poison_ev.set()
-            self.udp_sock.close()
-            th.append(self.sock_thread.thread)
+            _selector.remove_socket(self.udp_sock)
 
         with self._search_lock:
             self.search_results.clear()
         self.udp_sock = None
         self.broadcaster.disconnect()
 
-        if wait:
-            cur_thread = threading.current_thread()
-            for t in th:
-                if t is not cur_thread:
-                    t.join()
+        # if wait and self.command_thread is not threading.current_thread():
+        #     self.command_thread.join()
 
     def send(self, port, *commands):
         """
-        Process a command and tranport it over the UDP socket.
+        Process a command and transport it over the UDP socket.
         """
         with self.command_cond:
             bytes_to_send = self.broadcaster.send(*commands)
@@ -234,7 +273,7 @@ class SharedBroadcaster:
                 if isinstance(command, ca.VersionResponse):
                     # Check that the server version is one we can talk to.
                     assert command.version > 11
-                if isinstance(command, ca.SearchResponse):
+                elif isinstance(command, ca.SearchResponse):
                     with self._search_lock:
                         name = self.unanswered_searches.get(command.cid, None)
                         if name is not None:
@@ -334,19 +373,10 @@ class Context:
         # disconnect any circuits we have
         for circ in list(self.circuits.values()):
             if circ.connected:
-                st = circ.sock_thread
-                if st is not None:
-                    th.append(st.thread)
                 circ.disconnect()
 
         # clear any state about circuits and search results
         self.circuits.clear()
-
-        cur_thread = threading.current_thread()
-        # wait for all of the socket threads to stop
-        for t in th:
-            if t is not cur_thread:
-                t.join()
 
         # disconnect the underlying state machine
         self.broadcaster.remove_listener(self)
@@ -362,8 +392,7 @@ class Context:
 
 class VirtualCircuit:
     __slots__ = ('circuit', 'channels', 'ioids', 'subscriptionids',
-                 'new_command_cond', 'socket', 'sock_thread',
-                 'command_thread',
+                 'new_command_cond', 'socket', 'command_thread',
                  '__weakref__')
 
     def __init__(self, circuit):
@@ -373,7 +402,6 @@ class VirtualCircuit:
         self.subscriptionids = {}  # map subscriptionid to Channel
         self.new_command_cond = threading.Condition()  # ConditionType
         self.socket = None
-        self.sock_thread = None
         self.command_thread = threading.Thread(target=self.command_thread_loop,
                                                daemon=True)
 
@@ -383,10 +411,12 @@ class VirtualCircuit:
             return self.circuit.states[ca.CLIENT] is ca.CONNECTED
 
     def create_connection(self):
-        if self.sock_thread is not None:
-            raise RuntimeError('trying to reuse a VC')
+        # TODO check removed
+        # if self.sock_thread is not None:
+        #     raise RuntimeError('trying to reuse a VC')
         self.socket = socket.create_connection(self.circuit.address)
-        self.sock_thread = SocketThread(self.socket, self)
+        selector = get_selector()
+        selector.add_socket(self.socket, self)
 
     def send(self, *commands):
         with self.new_command_cond:
@@ -438,23 +468,14 @@ class VirtualCircuit:
 
         with self.new_command_cond:
             self.circuit.disconnect()
-        threads = []
-        if self.sock_thread is not None:
-            th = self.sock_thread.thread
-            self.sock_thread.poison_ev.set()
-            threads.append(th)
-        if self.command_thread is not None:
-            threads.append(self.command_thread)
-        if wait:
-            cur_thread = threading.current_thread()
-            for th in threads:
-                if th is not cur_thread:
-                    th.join()
+        if self.socket is not None:
+            _selector.remove_socket(self.socket)
+        if wait and self.command_thread is not threading.current_thread():
+            self.command_thread.join()
 
         self.channels.clear()
         self.ioids.clear()
         self.socket = None
-        self.sock_thread = None
 
     def __del__(self):
         try:
