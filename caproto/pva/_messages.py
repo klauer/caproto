@@ -773,6 +773,8 @@ class ConnectionValidationResponse(AdditionalFieldsMessage):
     client_buffer_size: int
     client_registry_size: int
     connection_qos: int
+    auth_nz: str
+    data: FieldDescAndData
 
     _fields_ = [
         ('client_buffer_size', ctypes.c_int32),
@@ -1044,6 +1046,7 @@ class ChannelGetRequest(SubcommandMessage):
 
     server_chid: int
     ioid: int
+    pv_request: PVRequest
 
     _fields_ = [
         ('server_chid', ctypes.c_int32),

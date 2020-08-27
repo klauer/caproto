@@ -61,10 +61,13 @@ class VirtualCircuit:
         self.subscriptions = defaultdict(deque)
         self.most_recent_updates = {}
         # This dict is passed to the loggers.
-        self._tags = {'their_address': self.circuit.address,
-                      'our_address': self.circuit.our_address,
-                      'direction': '<<<---',
-                      'role': repr(self.circuit.our_role)}
+        self._tags = {
+            'their_address': self.circuit.address,
+            'our_address': self.circuit.our_address,
+            'direction': '<<<---',
+            'role': repr(self.circuit.our_role),
+        }
+        self.authorization_info = {}
         # Subclasses are expected to define:
         # self.QueueFull = ...
         # self.message_queue = ...
@@ -276,12 +279,18 @@ class VirtualCircuit:
 
         to_send = []
         if isinstance(message, pva.ConnectionValidationResponse):
+            message = typing.cast(pva.ConnectionValidationResponse, message)
+            message: pva.ConnectionValidationResponse  # TODO: cast insufficient?
+            self.authorization_info.update(**{
+                'method': message.auth_nz,
+                'data': message.data.data,
+            })
             to_send = [
                 self.circuit.validated_connection()
             ]
         elif isinstance(message, pva.SearchRequest):
             ...
-            # message.channels -> searchreply
+            # TODO message.channels -> searchreply
         elif isinstance(message, pva.CreateChannelRequest):
             to_send = []
             for info in message.channels:
@@ -309,22 +318,51 @@ class VirtualCircuit:
             chan, db_entry = self._get_db_entry_from_message(message)
             ioid_info = self.circuit._ioids[message.ioid]
             chan = ioid_info['channel']
+
+            data = await db_entry.auth_read_interface(
+                authorization=self.authorization_info)
+
+            data = await db_entry.read(None)
             to_send = [
-                chan.read_interface(ioid=message.ioid, interface=db_entry)
+                chan.read_interface(ioid=message.ioid, interface=data)
             ]
         elif isinstance(message, pva.ChannelGetRequest):
+            message = typing.cast(pva.ChannelGetRequest, message)
+            message: pva.ChannelGetRequest
             chan, db_entry = self._get_db_entry_from_message(message)
             ioid_info = self.circuit._ioids[message.ioid]
             chan = ioid_info['channel']
             subcommand = message.subcommand
             if subcommand == Subcommand.INIT:
-                to_send = [
-                    chan.read_init(ioid=message.ioid, interface=db_entry)
-                ]
+                try:
+                    data = await db_entry.auth_read(
+                        message.pv_request, authorization=self.authorization_info)
+                except Exception as ex:
+                    to_send = [
+                        chan.read_init(
+                            ioid=message.ioid, interface=None,
+                            status=pva.Status.create_error(
+                                message=f'{ex.__class__.__name__}: {ex}',
+                            ),
+                        )
+                    ]
+                else:
+                    ioid_info['pv_request'] = message.pv_request
+                    ioid_info['interface'] = data
+                    to_send = [
+                        chan.read_init(ioid=message.ioid, interface=data)
+                    ]
             elif (subcommand == Subcommand.GET or subcommand == Subcommand.DEFAULT):
+                # NOTE: we'll only get here if INIT succeeded, where the
+                # authentication happens
+
+                # TODO: check if interface has changed
+                pv_request = ioid_info['pv_request']
+                # ioid_info['interface']
+                data = await db_entry.read(pv_request)
                 response = chan.read(
                     ioid=message.ioid,
-                    data=DataWithBitSet(data=db_entry,
+                    data=DataWithBitSet(data=data,
                                         bitset=pva.BitSet({0}),  # TODO
                                         ),
                 )

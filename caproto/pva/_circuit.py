@@ -382,7 +382,8 @@ class VirtualCircuit:
         if (isinstance(command, ChannelRequestDestroy) or
                 subcommand == Subcommand.DESTROY):
             self._ioids.pop(ioid)
-            self.cache.ioid_interfaces.pop(ioid)
+            # May not have been successful:
+            self.cache.ioid_interfaces.pop(ioid, None)
 
         # We are done. Run the Channel state change callbacks.
         for transition in transitions:
