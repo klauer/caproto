@@ -240,10 +240,11 @@ class Context(_Context):
             if isinstance(data, Exception):
                 self.log.exception('Broadcaster failed to receive on %s',
                                    interface, exc_info=data)
-                if sys.platform == 'win32':
+                if sys.platform == "win32":
                     self.log.warning(
-                        'Re-initializing socket on interface %s', interface
+                        "Re-initializing socket on interface %s", interface
                     )
+                    await self._create_broadcaster_transport(interface)
             else:
                 await self._broadcaster_recv_datagram(data, address)
 
