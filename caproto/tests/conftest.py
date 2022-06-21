@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Dict
+from typing import Callable, Dict
 
 import pytest
 
@@ -631,7 +631,13 @@ def pvdb_from_server_example(prefix: str) -> Dict[str, ca.ChannelData]:
     }
 
 
-def curio_runner(pvdb, client, *, threaded_client=False):
+def curio_runner(
+    pvdb: Dict[str, ca.ChannelData],
+    client: Callable,
+    *,
+    threaded_client: bool = False,
+    timeout: float = 60.0
+):
     # Hide these imports so that the other fixtures are usable by other
     # libraries (e.g. ophyd) without the experimental dependencies.
     import curio
@@ -676,7 +682,13 @@ def curio_runner(pvdb, client, *, threaded_client=False):
         kernel.run(run_server_and_client)
 
 
-def trio_runner(pvdb, client, *, threaded_client=False):
+def trio_runner(
+    pvdb: Dict[str, ca.ChannelData],
+    client: Callable,
+    *,
+    threaded_client: bool = False,
+    timeout: float = 60.0
+):
     # Hide these imports so that the other fixtures are usable by other
     # libraries (e.g. ophyd) without the experimental dependencies.
     import trio
@@ -719,7 +731,13 @@ def trio_runner(pvdb, client, *, threaded_client=False):
     trio.run(run_server_and_client)
 
 
-def asyncio_runner(pvdb, client, *, threaded_client=False):
+def asyncio_runner(
+    pvdb: Dict[str, ca.ChannelData],
+    client: Callable,
+    *,
+    threaded_client: bool = False,
+    timeout: float = 60.0
+):
     event = None
 
     async def asyncio_startup_hook(async_lib):
@@ -733,25 +751,37 @@ def asyncio_runner(pvdb, client, *, threaded_client=False):
             logger.error('Server failed: %s %s', type(ex), ex)
             raise
 
+    async def timeout_handler():
+        loop = asyncio.get_running_loop()
+        await asyncio.sleep(timeout)
+        print("Test timed out!")
+        loop.stop()
+
     async def run_server_and_client():
+        global test_canceler
         nonlocal event
         event = asyncio.Event()
         loop = asyncio.get_running_loop()
+        test_canceler = loop.close
         tsk = loop.create_task(asyncio_server_main())
+        timeout_tsk = loop.create_task(timeout_handler())
         # Give this a couple tries, akin to poll_readiness.
         await event.wait()
-        for _ in range(15):
-            try:
-                if threaded_client:
-                    await loop.run_in_executor(None, client)
+        try:
+            for _ in range(15):
+                try:
+                    if threaded_client:
+                        await loop.run_in_executor(None, client)
+                    else:
+                        await client()
+                except TimeoutError:
+                    continue
                 else:
-                    await client()
-            except TimeoutError:
-                continue
-            else:
-                break
-        tsk.cancel()
-        await asyncio.wait((tsk, ))
+                    break
+            tsk.cancel()
+            await asyncio.wait((tsk, ))
+        finally:
+            timeout_tsk.cancel()
 
     asyncio.run(run_server_and_client())
 
