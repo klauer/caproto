@@ -94,6 +94,13 @@ def _run_repeater(server_sock, bind_addr):
             msg, addr = server_sock.recvfrom(MAX_UDP_RECV)
         except ConnectionResetError as ex:
             logger.debug("Repeater ConnectionResetError during recvfrom: %s", ex)
+            try:
+                new_server_sock = check_for_running_repeater(server_sock.getsockname())
+            except Exception:
+                logger.debug("Tried to create a new repeater but failed: %s", ex)
+            else:
+                logger.debug("Replaced repeater UDP socket")
+                server_sock = new_server_sock
             time.sleep(0.1)
             continue
 
