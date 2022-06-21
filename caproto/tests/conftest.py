@@ -677,9 +677,13 @@ def curio_runner(
         finally:
             await server_task.cancel()
 
+    async def curio_main():
+        async with curio.timeout_after(timeout):
+            await run_server_and_client()
+
     with curio.Kernel() as kernel:
         curio_event = curio.Event()
-        kernel.run(run_server_and_client)
+        kernel.run(curio_main)
 
 
 def trio_runner(
@@ -707,26 +711,27 @@ def trio_runner(
             raise
 
     async def run_server_and_client():
-        async with trio.open_nursery() as test_nursery:
-            server_context = await test_nursery.start(trio_server_main)
-            if server_context is None:
-                raise RuntimeError("Failed to start server")
+        with trio.fail_after(timeout):
+            async with trio.open_nursery() as test_nursery:
+                server_context = await test_nursery.start(trio_server_main)
+                if server_context is None:
+                    raise RuntimeError("Failed to start server")
 
-            # Give this a couple tries, akin to poll_readiness.
-            for _ in range(15):
-                try:
-                    if threaded_client:
-                        await trio.to_thread.run_sync(client)
+                # Give this a couple tries, akin to poll_readiness.
+                for _ in range(15):
+                    try:
+                        if threaded_client:
+                            await trio.to_thread.run_sync(client)
+                        else:
+                            await client(test_nursery, server_context)
+                    except TimeoutError:
+                        continue
                     else:
-                        await client(test_nursery, server_context)
-                except TimeoutError:
-                    continue
-                else:
-                    break
+                        break
 
-            server_context.stop()
-            # don't leave the server running:
-            test_nursery.cancel_scope.cancel()
+                server_context.stop()
+                # don't leave the server running:
+                test_nursery.cancel_scope.cancel()
 
     trio.run(run_server_and_client)
 
@@ -758,11 +763,9 @@ def asyncio_runner(
         loop.stop()
 
     async def run_server_and_client():
-        global test_canceler
         nonlocal event
         event = asyncio.Event()
         loop = asyncio.get_running_loop()
-        test_canceler = loop.close
         tsk = loop.create_task(asyncio_server_main())
         timeout_tsk = loop.create_task(timeout_handler())
         # Give this a couple tries, akin to poll_readiness.
