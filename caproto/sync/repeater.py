@@ -93,15 +93,14 @@ def _run_repeater(server_sock, bind_addr):
         try:
             msg, addr = server_sock.recvfrom(MAX_UDP_RECV)
         except ConnectionResetError as ex:
-            logger.debug("Repeater ConnectionResetError during recvfrom: %s", ex)
-            try:
-                new_server_sock = check_for_running_repeater(server_sock.getsockname())
-            except Exception:
-                logger.debug("Tried to create a new repeater but failed: %s", ex)
-            else:
-                logger.debug("Replaced repeater UDP socket")
-                server_sock = new_server_sock
-            time.sleep(0.1)
+            # Win32: "On a UDP-datagram socket this error indicates
+            # a previous send operation resulted in an ICMP Port
+            # Unreachable message."
+            #
+            # https://docs.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-recvfrom
+            logger.debug(
+                "UDP socket reported previous send failed during recvfrom: %s", ex
+            )
             continue
 
         host, port = addr
