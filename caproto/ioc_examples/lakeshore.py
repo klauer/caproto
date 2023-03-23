@@ -14,14 +14,17 @@ has a ramp feature so that the setpoint ramps to the target value gradually.
 
 import asyncio
 import contextvars
+import logging
 import functools
-import threading
 import time
 
 from simple_pid import PID
 from caproto.server import PVGroup, ioc_arg_parser, pvproperty, run
 from ophyd import EpicsSignal, EpicsSignalRO, PVPositionerPC
 from ophyd import Component as Cpt
+
+
+logger = logging.getLogger(__name__)
 
 
 class ThermalMaterial:
@@ -57,7 +60,6 @@ class ThermalMaterial:
         self.cooling_constant = cooling_constant
         self.time = time.time()
         self._run = True
-        threading.Thread(target=self._simulate).start()
 
     @property
     def temperature(self):
@@ -83,14 +85,9 @@ class ThermalMaterial:
     def _heating(self):
         return self.heater_power
 
-    def _simulate(self):
-        while self._run:
-            now = time.time()
-            time_delta = now - self.time
-            self.time = now
-            self.energy += self._cooling() * time_delta
-            self.energy += self._heating() * time_delta
-            time.sleep(0.1)
+    def simulate(self, dt: float):
+        self.energy += self._cooling() * dt
+        self.energy += self._heating() * dt
 
 
 class PIDController(PID):
@@ -157,7 +154,6 @@ class PIDController(PID):
         self._run = True
         self._ramping = False
         self.history = {"output": [], "feedback": [], "setpoint": [], "timestamp": []}
-        threading.Thread(target=self._executor).start()
 
     @property
     def output(self):
@@ -170,6 +166,10 @@ class PIDController(PID):
     @property
     def setpoint(self):
         return self._setpoint
+
+    @property
+    def setpoint_target(self):
+        return self._setpoint_target
 
     @setpoint.setter
     def setpoint(self, value):
@@ -191,33 +191,25 @@ class PIDController(PID):
     def stop(self):
         self._run = False
 
-    def _executor(self):
-        iteration_time = 0.1
-        while self._run:
-            self._feedback = self._get_feedback()
-            self._output = self.__call__(self._get_feedback())
-            self.history["output"].append(self._output)
-            self.history["feedback"].append(self._feedback)
-            self.history["setpoint"].append(self.setpoint)
-            self.history["timestamp"].append(time.time())
-            self._set_output(self._output)
+    def simulate(self, dt: float):
+        self._feedback = self._get_feedback()
+        self._output = self.__call__(self._get_feedback())
+        self.history["output"].append(self._output)
+        self.history["feedback"].append(self._feedback)
+        self.history["setpoint"].append(self.setpoint)
+        self.history["timestamp"].append(time.time())
+        self._set_output(self._output)
 
-            # Ramping logic.
-            remaining = self._setpoint_target - self.setpoint
-            self._ramping = bool(remaining)
-            if isinstance(self.ramp_rate, (int, float)):
-                if remaining > 0:
-                    self._setpoint += min(
-                        self.ramp_rate * iteration_time, abs(remaining)
-                    )
-                elif remaining < 0:
-                    self._setpoint -= min(
-                        self.ramp_rate * iteration_time, abs(remaining)
-                    )
-            elif self.ramp_rate is None and remaining != 0:
-                self._setpoint = self._setpoint_target
-
-            time.sleep(iteration_time)
+        # Ramping logic.
+        remaining = self._setpoint_target - self.setpoint
+        self._ramping = bool(remaining)
+        if isinstance(self.ramp_rate, (int, float)):
+            if remaining > 0:
+                self._setpoint += min(self.ramp_rate * dt, abs(remaining))
+            elif remaining < 0:
+                self._setpoint -= min(self.ramp_rate * dt, abs(remaining))
+        elif self.ramp_rate is None and remaining != 0:
+            self._setpoint = self._setpoint_target
 
 
 internal_process = contextvars.ContextVar("internal_process", default=False)
@@ -246,6 +238,14 @@ class LakeshoreIOC(PVGroup):
     Simulated Lakeshore IOC with put completion on the setpoint.
     """
 
+    Kp = pvproperty(value=1.0, doc="PID parameter Kp")
+    Ki = pvproperty(value=0.1, doc="PID parameter Ki")
+    Kd = pvproperty(value=0, doc="PID parameter Kd")
+    ramp_rate = pvproperty(value=1.0, doc="Ramp rate")
+    setpoint = pvproperty(value=100.0, doc="temperature setpoint")
+    feedback = pvproperty(value=100.0, doc="temperature feedback")
+    output = pvproperty(value=100.0, doc="output value")
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._sample = ThermalMaterial()
@@ -258,54 +258,36 @@ class LakeshoreIOC(PVGroup):
             Kd=0.05,
             setpoint=150,
         )
+        self._last_tick = time.monotonic()
 
-    Kp = pvproperty(value=0, dtype=float, name="Kp", doc="PID parameter Kp")
+    async def __ainit__(self, async_lib):
+        self._pc_event = async_lib.Event()
 
-    @Kp.getter
-    async def Kp(self, instance):
-        return self._temperature_controller.Kp
-
-    @Kp.putter
-    async def Kp(self, instance, value):
-        self._temperature_controller.Kp = value
-        return value
-
-    Ki = pvproperty(value=0, dtype=float, name="Ki", doc="PID parameter Ki")
-
-    @Ki.getter
-    async def Ki(self, instance):
-        return self._temperature_controller.Ki
-
-    @Ki.putter
-    async def Ki(self, instance, value):
-        self._temperature_controller.Ki = value
-        return value
-
-    Kd = pvproperty(value=0, dtype=float, name="Kd", doc="PID parameter Kd")
-
-    @Kd.getter
-    async def Kd(self, instance):
-        return self._temperature_controller.Kd
-
-    @Kd.putter
-    async def Kd(self, instance, value):
-        self._temperature_controller.Kd = value
-        return value
-
-    ramp_rate = pvproperty(value=0, dtype=float, name="ramp_rate", doc="ramp_rate")
-
-    @ramp_rate.getter
-    async def ramp_rate(self, instance):
-        return self._temperature_controller.ramp_rate
-
-    @ramp_rate.putter
-    async def ramp_rate(self, instance, value):
-        self._temperature_controller.ramp_rate = value
-        return value
-
-    setpoint = pvproperty(
-        value=100, dtype=float, name="setpoint", doc="temperature setpoint"
-    )
+    async def simulate(self, dt: float):
+        # Update internal parameters
+        self._temperature_controller.Kd = self.Kd.value
+        self._temperature_controller.Ki = self.Ki.value
+        self._temperature_controller.Kp = self.Kp.value
+        self._temperature_controller.ramp_rate = self.ramp_rate.value
+        self._temperature_controller.setpoint = self.setpoint.value
+        # Simulate
+        self._sample.simulate(dt)
+        self._temperature_controller.simulate(dt)
+        # Update outputs
+        await self.feedback.write(self._temperature_controller.feedback)
+        await self.output.write(self._temperature_controller.output)
+        # Debug
+        logger.warning(
+            f"Simulate step dt={dt:.1f}s "
+            f"ramp_rate={self._temperature_controller.ramp_rate:.3f} "
+            f"Kp={self._temperature_controller.Kp:.3f} "
+            f"Ki={self._temperature_controller.Ki:.3f} "
+            f"Kd={self._temperature_controller.Kd:.3f} "
+            f"setpoint_target={self._temperature_controller.setpoint_target:.3f} "
+            f"setpoint={self._temperature_controller.setpoint:.3f} "
+            f"feedback={self.feedback.value:.3f} "
+            f"output={self.output.value:.3f}"
+        )
 
     async def wait_for_completion(self):
         """
@@ -316,47 +298,32 @@ class LakeshoreIOC(PVGroup):
                 return
             await asyncio.sleep(0.1)
 
-    @setpoint.getter
-    async def setpoint(self, instance):
-        return self._temperature_controller.setpoint
-
     @setpoint.putter
     @no_reentry
     async def setpoint(self, instance, value):
-        if not instance.ev.is_set():
-            await instance.ev.wait()
-            return self._temperature_controller.setpoint
+        logger.warning("New setpoint: %s", value)
+        await self.setpoint.write(value)
 
-        instance.ev.clear()
+        ev = self._pc_event
+        if not ev.is_set():
+            await ev.wait()
+            return self.setpoint.value
+
+        ev.clear()
         try:
-            self._temperature_controller.setpoint = value
             await self.wait_for_completion()
         finally:
-            instance.ev.set()
-        return self._temperature_controller.setpoint
+            ev.set()
+        return self.setpoint.value
 
-    @setpoint.startup
+    @setpoint.scan(period=0.1)
     async def setpoint(self, instance, async_lib):
         """
         This is needed to enable put completion.
         """
-        instance.async_lib = async_lib
-        instance.ev = async_lib.Event()
-        instance.ev.set()
-
-    feedback = pvproperty(
-        value=100, dtype=float, name="feedback", doc="temperature feedback"
-    )
-
-    @feedback.getter
-    async def feedback(self, instance):
-        return self._temperature_controller.feedback
-
-    output = pvproperty(value=100, dtype=float, name="output", doc="output value")
-
-    @output.getter
-    async def output(self, instance):
-        return self._temperature_controller.output
+        dt = time.monotonic() - self._last_tick
+        self._last_tick = time.monotonic()
+        await self.simulate(dt)
 
 
 class Lakeshore(PVPositionerPC):
@@ -387,4 +354,4 @@ if __name__ == "__main__":
     ioc = LakeshoreIOC(**ioc_options)
 
     print("PVs:", list(ioc.pvdb))
-    run(ioc.pvdb, **run_options)
+    run(ioc.pvdb, startup_hook=ioc.__ainit__, **run_options)
